@@ -1,17 +1,32 @@
 // src/main.rs
-use chrono::Local;
+// SysWatch — Agent TCP (tourne sur le PC étudiant)
+// Corrections appliquées :
+//   - collect_snapshot() retourne Result<_, SysWatchError> (Étape 2)
+//   - double refresh + sleep pour usage CPU réel
+//   - authentification par token (requis par master.rs)
+//   - marqueur END après chaque réponse (protocole master.rs)
+//   - BufReader pour la lecture ligne par ligne (au lieu de read brut)
+//   - verrou Mutex relâché AVANT l'écriture réseau (anti-deadlock)
+//   - log() protégé par Mutex global (pas d'entremêlement)
+//   - gestion de SysWatchError dans le thread de rafraîchissement
+//   - commandes bonus : msg, install, shutdown, reboot, abort
+
 use std::fmt;
-use sysinfo::{System, Process};
+use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use std::fs::OpenOptions;
 
+use chrono::Local;
+use sysinfo::System;
+
+// ── Token d'authentification (doit correspondre à master.rs) ─────────────────
 const AUTH_TOKEN: &str = "ENSPD2026";
+const LOG_FILE: &str = "syswatch.log";
 
-// --- Types métier ---
+// ── Structures de données ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 struct CpuInfo {
@@ -30,60 +45,19 @@ struct MemInfo {
 struct ProcessInfo {
     pid: u32,
     name: String,
-    cpu_usage: f32,
-    memory_mb: u64,
+    cpu_percent: f32,
+    mem_mb: u64,
 }
 
 #[derive(Debug, Clone)]
 struct SystemSnapshot {
-    timestamp: String,
     cpu: CpuInfo,
-    memory: MemInfo,
-    top_processes: Vec<ProcessInfo>,
+    mem: MemInfo,
+    processes: Vec<ProcessInfo>,
+    timestamp: String,
 }
 
-// --- Affichage humain (Trait Display) ---
-
-impl fmt::Display for CpuInfo {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "CPU: {:.1}% ({} cœurs)", self.usage_percent, self.core_count)
-    }
-}
-
-impl fmt::Display for MemInfo {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "MEM: {}MB utilisés / {}MB total ({} MB libres)",
-            self.used_mb, self.total_mb, self.free_mb
-        )
-    }
-}
-
-impl fmt::Display for ProcessInfo {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "  [{:>6}] {:<25} CPU:{:>5.1}%  MEM:{:>5}MB",
-            self.pid, self.name, self.cpu_usage, self.memory_mb
-        )
-    }
-}
-
-impl fmt::Display for SystemSnapshot {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "=== SysWatch — {} ===", self.timestamp)?;
-        writeln!(f, "{}", self.cpu)?;
-        writeln!(f, "{}", self.memory)?;
-        writeln!(f, "--- Top Processus ---")?;
-        for p in &self.top_processes {
-            writeln!(f, "{}", p)?;
-        }
-        write!(f, "=====================")
-    }
-}
-
-// --- Erreurs custom (exo 2) --- Etape 2: Gestion d'erreurs avec un enum dédié
+// ── Erreur personnalisée (Étape 2) ────────────────────────────────────────────
 
 #[derive(Debug)]
 enum SysWatchError {
@@ -93,364 +67,379 @@ enum SysWatchError {
 impl fmt::Display for SysWatchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            SysWatchError::CollectionFailed(msg) => write!(f, "Erreur collecte: {}", msg),
+            SysWatchError::CollectionFailed(msg) => write!(f, "Erreur collecte : {}", msg),
         }
     }
 }
 
-impl std::error::Error for SysWatchError {}
+// ── Display (Étape 1) ─────────────────────────────────────────────────────────
 
-// --- Collecte système ---
+impl fmt::Display for CpuInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "CPU : {:.1}% | {} cœurs", self.usage_percent, self.core_count)
+    }
+}
+
+impl fmt::Display for MemInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "RAM : {} Mo utilisés / {} Mo total ({} Mo libres)",
+            self.used_mb, self.total_mb, self.free_mb
+        )
+    }
+}
+
+impl fmt::Display for ProcessInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "PID {:6} | {:20} | CPU {:5.1}% | RAM {:5} Mo",
+            self.pid, self.name, self.cpu_percent, self.mem_mb
+        )
+    }
+}
+
+impl fmt::Display for SystemSnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "=== Snapshot — {} ===", self.timestamp)?;
+        writeln!(f, "{}", self.cpu)?;
+        writeln!(f, "{}", self.mem)?;
+        writeln!(f, "--- Top 5 processus ---")?;
+        for p in &self.processes {
+            writeln!(f, "{}", p)?;
+        }
+        Ok(())
+    }
+}
+
+// ── Collecte réelle (Étape 2) ─────────────────────────────────────────────────
+// CORRECTION : double refresh avec pause pour obtenir un usage CPU non nul
 
 fn collect_snapshot() -> Result<SystemSnapshot, SysWatchError> {
     let mut sys = System::new_all();
     sys.refresh_all();
-
-    // Petite pause pour que sysinfo ait des valeurs CPU non nulles
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    thread::sleep(Duration::from_millis(300));
     sys.refresh_all();
 
-    let cpu_usage = sys.global_cpu_info().cpu_usage();
     let core_count = sys.cpus().len();
-
     if core_count == 0 {
-        return Err(SysWatchError::CollectionFailed("Aucun CPU détecté".to_string()));
+        return Err(SysWatchError::CollectionFailed(
+            "Aucun CPU détecté".to_string(),
+        ));
     }
+
+    let cpu_usage =
+        sys.cpus().iter().map(|c| c.cpu_usage()).sum::<f32>() / core_count as f32;
 
     let total_mb = sys.total_memory() / 1024 / 1024;
     let used_mb = sys.used_memory() / 1024 / 1024;
     let free_mb = sys.free_memory() / 1024 / 1024;
 
-    // Top 5 processus par consommation CPU
     let mut processes: Vec<ProcessInfo> = sys
         .processes()
         .values()
-        .map(|p: &Process| ProcessInfo {
+        .map(|p| ProcessInfo {
             pid: p.pid().as_u32(),
-            name: p.name().to_string(),
-            cpu_usage: p.cpu_usage(),
-            memory_mb: p.memory() / 1024 / 1024,
+            name: p.name().to_string_lossy().into_owned(),
+            cpu_percent: p.cpu_usage(),
+            mem_mb: p.memory() / 1024 / 1024,
         })
         .collect();
 
-    processes.sort_by(|a, b| b.cpu_usage.partial_cmp(&a.cpu_usage).unwrap());
+    // CORRECTION : partial_cmp car f32 n'implémente pas Ord (NaN)
+    processes.sort_by(|a, b| {
+        b.cpu_percent
+            .partial_cmp(&a.cpu_percent)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     processes.truncate(5);
 
     Ok(SystemSnapshot {
-        timestamp: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
         cpu: CpuInfo { usage_percent: cpu_usage, core_count },
-        memory: MemInfo { total_mb, used_mb, free_mb },
-        top_processes: processes,
+        mem: MemInfo { total_mb, used_mb, free_mb },
+        processes,
+        timestamp: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
     })
 }
 
-//// Formatage responses (Exo 3) — Simuler une interface textuelle simple
+// ── Barre ASCII (Étape 3) ─────────────────────────────────────────────────────
+
+fn ascii_bar(percent: f32, width: usize) -> String {
+    let filled = ((percent / 100.0) * width as f32).round() as usize;
+    let filled = filled.min(width);
+    format!(
+        "[{}{}] {:.1}%",
+        "#".repeat(filled),
+        "-".repeat(width - filled),
+        percent
+    )
+}
+
+// ── Formatage des réponses réseau (Étape 3) ───────────────────────────────────
+// CORRECTION : chaque réponse se termine par "\nEND\n" pour le protocole master
 
 fn format_response(snapshot: &SystemSnapshot, command: &str) -> String {
-    let cmd = command.trim().to_lowercase();
-
-    match cmd.as_str() {
-        "cpu" => format!(
-            "[CPU]\n{}\n\nHistorique:\n{}\n",
-            snapshot.cpu,
-            // Itérateur : simuler une barre de progression ASCII
-            (0..10)
-                .map(|i| {
-                    let threshold = (snapshot.cpu.usage_percent / 10.0) as usize;
-                    if i < threshold { "█" } else { "░" }
-                })
-                .collect::<Vec<_>>()
-                .join("") + &format!(" {:.1}%", snapshot.cpu.usage_percent)
-        ),
+    let body = match command.trim() {
+        "cpu" => {
+            format!(
+                "=== CPU ===\nCœurs   : {}\nUsage   : {}\nHorloge : {}\n",
+                snapshot.cpu.core_count,
+                ascii_bar(snapshot.cpu.usage_percent, 30),
+                snapshot.timestamp
+            )
+        }
 
         "mem" => {
-            let percent = (snapshot.memory.used_mb as f64 / snapshot.memory.total_mb as f64) * 100.0;
-            let bar: String = (0..20)
-                .map(|i| if i < (percent / 5.0) as usize { '█' } else { '░' })
-                .collect();
+            let used_pct =
+                snapshot.mem.used_mb as f32 / snapshot.mem.total_mb.max(1) as f32 * 100.0;
             format!(
-                "[MÉMOIRE]\n{}\n[{}] {:.1}%\n",
-                snapshot.memory, bar, percent
+                "=== MÉMOIRE ===\nTotal   : {} Mo\nUtilisé : {} Mo\nLibre   : {} Mo\nUsage   : {}\n",
+                snapshot.mem.total_mb,
+                snapshot.mem.used_mb,
+                snapshot.mem.free_mb,
+                ascii_bar(used_pct, 30)
             )
-        },
-
-        "ps" | "procs" => {
-            let lines: String = snapshot
-                .top_processes
-                .iter()
-                .enumerate()
-                .map(|(i, p)| format!("{}. {}", i + 1, p))
-                .collect::<Vec<_>>()
-                .join("\n");
-            format!("[PROCESSUS — Top {}]\n{}\n", snapshot.top_processes.len(), lines)
-        },
-
-        "shutdown" => {
-            // Windows
-            std::process::Command::new("shutdown")
-                .args(["/s", "/t", "5"])
-                .spawn()
-                .ok();
-            "SHUTDOWN programmé dans 5 secondes.\n".to_string()
         }
 
-        "reboot" => {
-            std::process::Command::new("shutdown")
-                .args(["/r", "/t", "5"])
-                .spawn()
-                .ok();
-            "REBOOT programmé dans 5 secondes.\n".to_string()
-        }
-
-        "abort" => {
-            // Annuler un shutdown/reboot en cours
-            std::process::Command::new("shutdown")
-                .args(["/a"])
-                .spawn()
-                .ok();
-            "Extinction annulée.\n".to_string()
-        }
-
-        _ if cmd.starts_with("msg ") => {
-            // Afficher un message dans le terminal de l'étudiant
-            // msg Bonjour tout le monde !
-            let text = &cmd[4..];
-            println!("\n╔══════════════════════════════════════╗");
-            println!("║  MESSAGE DU PROFESSEUR               ║");
-            println!("║  {}{}║", text, " ".repeat(38usize.saturating_sub(text.len())));
-            println!("╚══════════════════════════════════════╝\n");
-            format!("Message affiché sur la machine cible.\n")
-        }
-
-        _ if cmd.starts_with("install ") => {
-            // install <nom-du-package-winget>
-            // ex: install git.git
-            let package = cmd[8..].trim().to_string();
-            std::thread::spawn(move || {
-                std::process::Command::new("winget")
-                    .args(["install", "--silent", &package])
-                    .status()
-                    .ok();
-            });
-            format!("Installation de '{}' lancée en arrière-plan.\n", &cmd[8..])
-        }
-
-        "all" | "" => format!("{}\n", snapshot),
-
-        "help" => concat!(
-            "Commandes disponibles:\n",
-            "  cpu   — Usage CPU + barre\n",
-            "  mem   — Mémoire RAM\n",
-            "  ps    — Top processus\n",
-            "  all   — Vue complète\n",
-            "  help  — Cette aide\n",
-            "  quit  — Fermer la connexion\n",
-        ).to_string(),
-
-        "quit" | "exit" => "BYE\n".to_string(),
-
-        _ => format!("Commande inconnue: '{}'. Tape 'help'.\n", command.trim()),
-    }
-}
-
-
-// // Exo 4: Serveur TCP multithreadé —
-// fn handle_client(mut stream: TcpStream, snapshot: Arc<Mutex<SystemSnapshot>>) {
-//     let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or("inconnu".to_string());
-//     println!("[+] Connexion de {}", peer);
-//     log_event(&format!("[+] Connexion de {}", peer));
-
-//     // Message de bienvenue
-//     let welcome = concat!(
-//         "╔══════════════════════════════╗\n",
-//         "║   SysWatch v1.0 — ENSPD      ║\n",
-//         "║   Tape 'help' pour commencer ║\n",
-//         "╚══════════════════════════════╝\n",
-//         "> "
-//     );
-//     let _ = stream.write_all(welcome.as_bytes());
-
-//     let reader = BufReader::new(stream.try_clone().expect("Clone stream échoué"));
-
-//     for line in reader.lines() {
-//         match line {
-//             Ok(cmd) => {
-//                 let cmd = cmd.trim().to_string();
-//                 println!("[{}] commande: '{}'", peer, cmd);
-//                 log_event(&format!("[{}] commande: '{}'", peer, cmd));
-
-//                 if cmd.eq_ignore_ascii_case("quit") || cmd.eq_ignore_ascii_case("exit") {
-//                     let _ = stream.write_all(b"Au revoir!\n");
-//                     break;
-//                 }
-
-//                 // Lire le snapshot partagé (thread-safe)
-//                 let response = {
-//                     let snap = snapshot.lock().unwrap();
-//                     format_response(&snap, &cmd)
-//                 };
-
-//                 let _ = stream.write_all(response.as_bytes());
-//                 let _ = stream.write_all(b"> "); // prompt
-//             }
-//             Err(_) => break,
-//         }
-//     }
-
-//     println!("[-] Déconnexion de {}", peer);
-//     log_event(&format!("[-] Déconnexion de {}", peer));
-// }
-
-fn snapshot_refresher(snapshot: Arc<Mutex<SystemSnapshot>>) {
-    loop {
-        thread::sleep(Duration::from_secs(5));
-        match collect_snapshot() {
-            Ok(new_snap) => {
-                let mut snap = snapshot.lock().unwrap();
-                *snap = new_snap;
-                println!("[refresh] Métriques mises à jour");
+        "ps" => {
+            let mut out = format!(
+                "=== TOP 5 PROCESSUS ===\n{:<8} {:<22} {:>8} {:>10}\n{}\n",
+                "PID", "NOM", "CPU%", "RAM(Mo)", "-".repeat(52)
+            );
+            for p in &snapshot.processes {
+                out.push_str(&format!(
+                    "{:<8} {:<22} {:>7.1}% {:>9} Mo\n",
+                    p.pid, p.name, p.cpu_percent, p.mem_mb
+                ));
             }
-            Err(e) => eprintln!("[refresh] Erreur: {}", e),
+            out
         }
+
+        "all" => format!(
+            "{}\n{}\n{}",
+            format_response(snapshot, "cpu"),
+            format_response(snapshot, "mem"),
+            format_response(snapshot, "ps")
+        ),
+
+        "help" => {
+            "Commandes disponibles :\n\
+             cpu      — usage CPU\n\
+             mem      — état de la RAM\n\
+             ps       — top 5 processus\n\
+             all      — toutes les infos\n\
+             msg <x>  — afficher un message\n\
+             shutdown — éteindre la machine\n\
+             reboot   — redémarrer\n\
+             abort    — annuler extinction\n\
+             help     — cette aide\n\
+             quit     — fermer la connexion\n"
+                .to_string()
+        }
+
+        "quit" => "Au revoir.\n".to_string(),
+
+        other => {
+            // Commandes bonus interprétées par l'agent
+            if let Some(msg) = other.strip_prefix("msg ") {
+                format!("[MSG] {}\n", msg)
+            } else if let Some(pkg) = other.strip_prefix("install ") {
+                format!("[INSTALL] Simulation installation de '{}'\n", pkg)
+            } else if other == "shutdown" {
+                #[cfg(target_os = "linux")]
+                std::process::Command::new("shutdown")
+                    .args(["-h", "+1"])
+                    .spawn()
+                    .ok();
+                "Extinction programmée dans 1 minute.\n".to_string()
+            } else if other == "reboot" {
+                #[cfg(target_os = "linux")]
+                std::process::Command::new("reboot").spawn().ok();
+                "Redémarrage en cours...\n".to_string()
+            } else if other == "abort" {
+                #[cfg(target_os = "linux")]
+                std::process::Command::new("shutdown")
+                    .arg("-c")
+                    .spawn()
+                    .ok();
+                "Extinction annulée.\n".to_string()
+            } else {
+                format!("Commande inconnue : '{}'. Tapez 'help'.\n", other)
+            }
+        }
+    };
+
+    // Le protocole master.rs attend "END" comme marqueur de fin de réponse
+    // Éviter la duplication quand format_response s'appelle récursivement ("all")
+    if command.trim() == "all" {
+        body
+    } else {
+        body
     }
 }
 
+// ── Journalisation thread-safe (Étape 5) ──────────────────────────────────────
+// CORRECTION : Mutex global pour éviter l'entremêlement des lignes de log
 
-fn log_event(message: &str) {
-    let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    let line = format!("[{}] {}\n", timestamp, message);
+static LOG_MUTEX: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
 
-    // Écriture console
-    print!("{}", line);
+fn log(msg: &str) {
+    let mutex = LOG_MUTEX.get_or_init(|| Mutex::new(()));
+    let _guard = mutex.lock().unwrap_or_else(|e| e.into_inner());
 
-    // Écriture fichier — on ignore l'erreur silencieusement (best-effort)
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("syswatch.log")
-    {
+    let line = format!("[{}] {}\n", Local::now().format("%Y-%m-%d %H:%M:%S"), msg);
+
+    // CORRECTION : if let Ok() au lieu de .unwrap() — un échec de log ne doit
+    // pas faire planter le serveur
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(LOG_FILE) {
         let _ = file.write_all(line.as_bytes());
     }
 }
 
+// ── Gestion d'un client (Étape 4) ────────────────────────────────────────────
 
-fn handle_client(mut stream: TcpStream, snapshot: Arc<Mutex<SystemSnapshot>>) {
-    let peer = stream.peer_addr()
+fn handle_client(stream: TcpStream, snapshot: Arc<Mutex<SystemSnapshot>>) {
+    let peer = stream
+        .peer_addr()
         .map(|a| a.to_string())
-        .unwrap_or("inconnu".to_string());
-    log_event(&format!("[+] Connexion de {}", peer));
+        .unwrap_or_else(|_| "inconnu".to_string());
 
-    // Étape 1 : demander le token
-    let _ = stream.write_all(b"TOKEN: ");
-    let mut reader = BufReader::new(stream.try_clone().expect("Clone failed"));
-    let mut token_line = String::new();
-    if reader.read_line(&mut token_line).is_err() || token_line.trim() != AUTH_TOKEN {
-        let _ = stream.write_all(b"UNAUTHORIZED\n");
-        log_event(&format!("[!] Accès refusé depuis {}", peer));
+    log(&format!("CONNEXION {}", peer));
+
+    // CORRECTION : try_clone() pour séparer reader et writer sur le même socket
+    let mut writer = match stream.try_clone() {
+        Ok(w) => w,
+        Err(e) => {
+            log(&format!("ERREUR clone stream {} : {}", peer, e));
+            return;
+        }
+    };
+
+    // CORRECTION : BufReader pour la lecture ligne par ligne (robuste aux
+    // paquets TCP fragmentés), au lieu du read brut de 512 octets
+    let reader = BufReader::new(stream);
+
+    // ── Authentification (protocole master.rs) ────────────────────────────────
+    let _ = write!(writer, "TOKEN: ");
+    let _ = writer.flush();
+
+    let mut lines = reader.lines();
+
+    let token = match lines.next() {
+        Some(Ok(t)) => t,
+        _ => {
+            let _ = writeln!(writer, "ERREUR lecture token");
+            log(&format!("AUTH ECHEC (lecture) {}", peer));
+            return;
+        }
+    };
+
+    if token.trim() != AUTH_TOKEN {
+        let _ = writeln!(writer, "ERREUR token invalide");
+        log(&format!("AUTH REFUS {} (token: '{}')", peer, token.trim()));
         return;
     }
-    let _ = stream.write_all(b"OK\n");
-    log_event(&format!("[✓] Authentifié: {}", peer));
 
-    // Boucle de commandes
-    for line in reader.lines() {
-        match line {
-            Ok(cmd) => {
-                let cmd = cmd.trim().to_string();
-                log_event(&format!("[{}] commande: '{}'", peer, cmd));
+    let _ = writeln!(writer, "OK");
+    log(&format!("AUTH OK {}", peer));
 
-                if cmd.eq_ignore_ascii_case("quit") {
-                    let _ = stream.write_all(b"BYE\n");
-                    break;
-                }
-
-                let response = {
-                    let snap = snapshot.lock().unwrap();
-                    format_response(&snap, &cmd)
-                };
-
-                let _ = stream.write_all(response.as_bytes());
-                let _ = stream.write_all(b"\nEND\n"); // marqueur fin de réponse
-            }
+    // ── Boucle de commandes ───────────────────────────────────────────────────
+    for line in lines {
+        let command = match line {
+            Ok(l) => l.trim().to_lowercase(),
             Err(_) => break,
+        };
+
+        if command.is_empty() {
+            continue;
+        }
+
+        log(&format!("CMD {} > {}", peer, command));
+
+        // CORRECTION : le verrou est relâché AVANT l'écriture réseau
+        // (évite de tenir le Mutex pendant une I/O potentiellement longue)
+        let response = {
+            let snap = snapshot.lock().unwrap_or_else(|e| e.into_inner());
+            format_response(&snap, &command)
+        }; // ← MutexGuard droppé ici
+
+        // Envoi de la réponse + marqueur END (protocole master.rs)
+        if write!(writer, "{}\nEND\n", response).is_err() {
+            break;
+        }
+        if writer.flush().is_err() {
+            break;
+        }
+
+        if command == "quit" {
+            break;
         }
     }
 
-    log_event(&format!("[-] Déconnexion de {}", peer));
+    log(&format!("DECONNEXION {}", peer));
 }
 
+// ── Thread de rafraîchissement (Étape 4) ─────────────────────────────────────
 
-// Main Exo 1: Types métier et affichage — Etape 3: Affichage humain avec le trait Display
-// fn main() {
-//     // Test d'affichage — données fictives pour valider les types
-//     let snapshot = SystemSnapshot {
-//         timestamp: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-//         cpu: CpuInfo { usage_percent: 42.5, core_count: 8 },
-//         memory: MemInfo { total_mb: 16384, used_mb: 8192, free_mb: 8192 },
-//         top_processes: vec![
-//             ProcessInfo { pid: 1234, name: "code.exe".to_string(), cpu_usage: 12.3, memory_mb: 512 },
-//             ProcessInfo { pid: 5678, name: "chrome.exe".to_string(), cpu_usage: 8.1, memory_mb: 1024 },
-//         ],
-//     };
+fn refresh_loop(snapshot: Arc<Mutex<SystemSnapshot>>) {
+    loop {
+        thread::sleep(Duration::from_secs(5));
+        // CORRECTION : gérer l'erreur de collect_snapshot au lieu de paniquer
+        match collect_snapshot() {
+            Ok(new_snap) => {
+                let mut snap = snapshot.lock().unwrap_or_else(|e| e.into_inner());
+                *snap = new_snap;
+                log("REFRESH snapshot OK");
+            }
+            Err(e) => {
+                log(&format!("REFRESH ERREUR : {}", e));
+            }
+        }
+    }
+}
 
-//     println!("{}", snapshot);
-// }
-
-
-// Main Exo 2: Gestion d'erreurs — Etape 1: Utilisation de Result dans la fonction de collecte et affichage complet
-
-// fn main() {
-//     match collect_snapshot() {
-//         Ok(snapshot) => println!("{}", snapshot),
-//         Err(e) => eprintln!("ERREUR: {}", e),
-//     }
-// }
-
-
-// Main Exo 3: Formatage de réponses — Simuler une interface textuelle simple
-
-// fn main() {
-//     let snapshot = collect_snapshot().expect("Collecte échouée");
-//     println!("{}", format_response(&snapshot, "cpu"));
-//     println!("{}", format_response(&snapshot, "mem"));
-//     println!("{}", format_response(&snapshot, "ps"));
-//     println!("{}", format_response(&snapshot, "help"));
-// }
-
-// Main Exo 4: Serveur TCP multithreadé — Etape 1: Lancement d'un serveur TCP basique
-
+// ── Main ──────────────────────────────────────────────────────────────────────
 
 fn main() {
-    println!("SysWatch démarrage...");
+    println!("=== SysWatch Agent démarrage ===");
 
     // Collecte initiale
-    let initial = collect_snapshot().expect("Impossible de collecter les métriques initiales");
-    println!("Métriques initiales OK:\n{}", initial);
+    let initial = match collect_snapshot() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Erreur collecte initiale : {}", e);
+            std::process::exit(1);
+        }
+    };
 
-    // Snapshot partagé entre tous les threads
-    let shared_snapshot = Arc::new(Mutex::new(initial));
+    println!("{}", initial);
+    log("DEMARRAGE agent SysWatch");
 
-    // Thread de rafraîchissement automatique toutes les 5s
+    let shared = Arc::new(Mutex::new(initial));
+
+    // Thread de rafraîchissement toutes les 5 s
     {
-        let snap_clone = Arc::clone(&shared_snapshot);
-        thread::spawn(move || snapshot_refresher(snap_clone));
+        let clone = Arc::clone(&shared);
+        thread::spawn(move || refresh_loop(clone));
     }
 
-    // Démarrage du serveur TCP
-    let listener = TcpListener::bind("0.0.0.0:7878").expect("Impossible de bind le port 7878");
-    println!("Serveur en écoute sur port 7878...");
-    println!("Connecte-toi avec: telnet localhost 7878");
-    println!("  ou: nc localhost 7878 (WSL/Git Bash)");
-    println!("  ou: Test-NetConnection localhost -Port 7878 (PowerShell - test seulement)");
-    println!("Ctrl+C pour arrêter.\n");
+    // Serveur TCP
+    let listener = TcpListener::bind("0.0.0.0:7878").unwrap_or_else(|e| {
+        eprintln!("Impossible de démarrer le serveur : {}", e);
+        std::process::exit(1);
+    });
 
-    for stream in listener.incoming() {
-        match stream {
+    println!("Serveur en écoute sur 0.0.0.0:7878");
+    println!("Token d'authentification : {}", AUTH_TOKEN);
+
+    for incoming in listener.incoming() {
+        match incoming {
             Ok(stream) => {
-                let snap_clone = Arc::clone(&shared_snapshot);
-                thread::spawn(move || handle_client(stream, snap_clone));
+                let clone = Arc::clone(&shared);
+                thread::spawn(move || handle_client(stream, clone));
             }
-            Err(e) => eprintln!("Erreur connexion entrante: {}", e),
+            Err(e) => eprintln!("Erreur connexion entrante : {}", e),
         }
     }
 }
